@@ -146,25 +146,21 @@ def is_actually_english(text):
         
     return True
 
-def fetch_forum_posts_api(menu_seq, rows=15, english_only=True):
+def fetch_forum_posts_api(menu_seq, rows=15, english_only=False): # <--- Default False dulu
     try:
         session = requests.Session()
         main_url = f"https://forum.netmarble.com/sk_rebirth_gl/list/{menu_seq}/1"
         
-        # Header dimiripin asli biar gak dikira bot
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Referer': main_url,
-            'Accept-Language': 'en-US,en;q=0.9', # Request English preference
-            'Cookie': 'netmarble_locale=en_US;' # Pancing server pake cookie locale
+            'Referer': main_url
         }
         
-        # Tambahan param buat maksa sort new
-        fetch_rows = rows * 2 # Ambil lebih banyak buat jaga2 ke-filter
-        
         api_url = "https://forum.netmarble.com/api/game/tskgb/official/forum/sk_rebirth_gl/article/list"
+        
+        # Kita minta dikit aja dulu (rows=10) buat ngecek
         params = {
-            'rows': fetch_rows,
+            'rows': 10, 
             'start': 0,
             'viewType': 'pv',
             'menuSeq': menu_seq,
@@ -172,7 +168,7 @@ def fetch_forum_posts_api(menu_seq, rows=15, english_only=True):
             '_': int(time.time() * 1000)
         }
         
-        print(f"Requesting API: {menu_seq}...")
+        print(f"\n[{menu_seq}] Requesting API RAW MODE...")
         response = session.get(api_url, headers=headers, params=params, timeout=15)
         response.raise_for_status()
         
@@ -180,42 +176,34 @@ def fetch_forum_posts_api(menu_seq, rows=15, english_only=True):
         posts = []
         
         if 'articleList' in data and data['articleList']:
-            for item in data['articleList']:
+            raw_list = data['articleList']
+            print(f"[{menu_seq}] API returned {len(raw_list)} raw items.")
+            
+            for i, item in enumerate(raw_list):
                 try:
                     title = item.get('articleTitle', '').strip()
-                    if not title: continue
-
-                    # --- LOGIKA FILTER YANG LEBIH CERDAS ---
-                    if english_only:
-                        lang_cd = str(item.get('languageTypeCd', '')).lower()
-                        
-                        # 1. Cek Metadata API (Kalau ada)
-                        # Kalau tagnya jelas-jelas 'ko', 'zh', 'jp', skip langsung.
-                        if lang_cd in ['ko', 'zh-tw', 'zh-cn', 'jp', 'th']:
-                            continue
-                            
-                        # 2. Cek Judul (The Real Check)
-                        # Kalau tagnya 'missing' atau 'en', kita validasi judulnya
-                        # Apakah judulnya mengandung huruf Korea/China?
-                        if not is_actually_english(title):
-                            # print(f"  ⏭️ Skip Non-English Title: {title[:20]}...")
-                            continue
+                    lang_cd = item.get('languageTypeCd', 'NONE') # Biarin mentah
                     
-                    # Kalau lolos filter di atas, proses postnya
+                    # --- DEBUG PRINT (PENTING) ---
+                    # Kita print 5 item pertama buat dilihat user
+                    if i < 5:
+                        print(f"  #{i+1} | Lang: [{lang_cd}] | Title: {title[:50]}...")
+                    
+                    # AMBIL SEMUA TANPA FILTER
                     post = parse_article(item, menu_seq)
                     if post['id']:
                         posts.append(post)
-                    
-                    if len(posts) >= rows:
-                        break
                         
                 except Exception as e:
+                    print(f"  ❌ Error parsing item #{i}: {e}")
                     continue
             
-            print(f"✅ Got {len(posts)} English posts from menu {menu_seq}")
+            print(f"[{menu_seq}] ✅ Total collected: {len(posts)}")
             return posts
             
-        return []
+        else:
+            print(f"[{menu_seq}] ⚠️ Empty articleList!")
+            return []
         
     except Exception as e:
         print(f"Error fetching forum via API: {e}")
