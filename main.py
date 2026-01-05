@@ -3,6 +3,7 @@ import json
 import os
 from datetime import datetime
 import time
+import re
 
 class SupabaseClient:
     """Simple Supabase client untuk REST API"""
@@ -129,40 +130,39 @@ def parse_article(item, menu_seq):
         'article_seq': article_seq
     }
 
+def is_actually_english(text):
+    """
+    Cek apakah text mayoritas ASCII (English).
+    Return False jika terdeteksi karakter CJK (China/Japan/Korea)
+    """
+    if not text: return False
+    
+    # Cek apakah ada karakter Hangul (Korea), Hiragana/Katakana (Jepang), atau Hanzi (China)
+    # Range Unicode untuk CJK
+    cjk_pattern = re.compile(r'[\u4e00-\u9fff\uac00-\ud7af\u3040-\u309f\u30a0-\u30ff]')
+    
+    if cjk_pattern.search(text):
+        return False # Ada huruf cacing, berarti bukan English
+        
+    return True
 
 def fetch_forum_posts_api(menu_seq, rows=15, english_only=True):
-    """
-    Fetch posts from forum using API
-    
-    Args:
-        menu_seq: Menu sequence (10=Notices, 11=Updates, 13=Developer Notes)
-        rows: Number of posts to fetch
-        english_only: Filter only English posts (via languageTypeCd)
-    
-    Returns:
-        List of parsed posts
-    """
     try:
         session = requests.Session()
-        
-        # Visit main page for cookies
         main_url = f"https://forum.netmarble.com/sk_rebirth_gl/list/{menu_seq}/1"
-        session.get(main_url, timeout=15)
         
-        # API endpoint
-        api_url = "https://forum.netmarble.com/api/game/tskgb/official/forum/sk_rebirth_gl/article/list"
-        
+        # Header dimiripin asli biar gak dikira bot
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/json, text/javascript, */*; q=0.01',
-            'Accept-Language': 'en-US,en;q=0.9',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Referer': main_url,
-            'X-Requested-With': 'XMLHttpRequest',
+            'Accept-Language': 'en-US,en;q=0.9', # Request English preference
+            'Cookie': 'netmarble_locale=en_US;' # Pancing server pake cookie locale
         }
         
-        # Fetch more rows to account for filtering
-        fetch_rows = rows * 3 if english_only else rows
+        # Tambahan param buat maksa sort new
+        fetch_rows = rows * 2 # Ambil lebih banyak buat jaga2 ke-filter
         
+        api_url = "https://forum.netmarble.com/api/game/tskgb/official/forum/sk_rebirth_gl/article/list"
         params = {
             'rows': fetch_rows,
             'start': 0,
@@ -172,9 +172,7 @@ def fetch_forum_posts_api(menu_seq, rows=15, english_only=True):
             '_': int(time.time() * 1000)
         }
         
-        print(f"Requesting: {api_url}")
-        print(f"Params: {params}")
-        
+        print(f"Requesting API: {menu_seq}...")
         response = session.get(api_url, headers=headers, params=params, timeout=15)
         response.raise_for_status()
         
@@ -182,81 +180,43 @@ def fetch_forum_posts_api(menu_seq, rows=15, english_only=True):
         posts = []
         
         if 'articleList' in data and data['articleList']:
-            print(f"API returned {len(data['articleList'])} articles")
-            
             for item in data['articleList']:
                 try:
-                    # Get RAW values
-                    lang_cd_raw = item.get('languageTypeCd', 'MISSING')
                     title = item.get('articleTitle', '').strip()
-                    
-                    # Print RAW untuk debug
-                    print(f"\n{'='*60}")
-                    print(f"RAW DATA:")
-                    print(f"  languageTypeCd: '{lang_cd_raw}'")
-                    print(f"  type: {type(lang_cd_raw)}")
-                    print(f"  repr: {repr(lang_cd_raw)}")
-                    print(f"  title: {title[:50]}")
-                    
-                    # Clean
-                    lang_cd = str(lang_cd_raw).strip().lower()
-                    print(f"  cleaned: '{lang_cd}'")
-                    
-                    # Check condition
-                    is_en_us = lang_cd == 'en_us'
-                    is_en = lang_cd == 'en'
-                    starts_en = lang_cd.startswith('en')
-                    
-                    print(f"  is 'en_us': {is_en_us}")
-                    print(f"  is 'en': {is_en}")
-                    print(f"  starts with 'en': {starts_en}")
-                    print(f"  english_only param: {english_only}")
-                    
-                    # Skip if no title
-                    if not title:
-                        print(f"  ❌ SKIP: No title")
-                        continue
-                    
-                    # Filter logic
+                    if not title: continue
+
+                    # --- LOGIKA FILTER YANG LEBIH CERDAS ---
                     if english_only:
-                        is_english = lang_cd in ['en_us', 'en', 'en-us'] or lang_cd.startswith('en')
-                        print(f"  is_english: {is_english}")
+                        lang_cd = str(item.get('languageTypeCd', '')).lower()
                         
-                        if not is_english:
-                            print(f"  ❌ SKIP: Not English")
+                        # 1. Cek Metadata API (Kalau ada)
+                        # Kalau tagnya jelas-jelas 'ko', 'zh', 'jp', skip langsung.
+                        if lang_cd in ['ko', 'zh-tw', 'zh-cn', 'jp', 'th']:
                             continue
-                        else:
-                            print(f"  ✅ PASS: Is English!")
+                            
+                        # 2. Cek Judul (The Real Check)
+                        # Kalau tagnya 'missing' atau 'en', kita validasi judulnya
+                        # Apakah judulnya mengandung huruf Korea/China?
+                        if not is_actually_english(title):
+                            # print(f"  ⏭️ Skip Non-English Title: {title[:20]}...")
+                            continue
                     
-                    # Parse article
+                    # Kalau lolos filter di atas, proses postnya
                     post = parse_article(item, menu_seq)
+                    if post['id']:
+                        posts.append(post)
                     
-                    if not post['title'] or not post['id']:
-                        print(f"  ❌ SKIP: Missing title/ID after parse")
-                        continue
-                    
-                    print(f"  ✅ ADDED to posts list")
-                    posts.append(post)
-                    
-                    # Stop when we have enough
                     if len(posts) >= rows:
-                        print(f"\n✅ Reached {rows} posts, stopping")
                         break
-                    
+                        
                 except Exception as e:
-                    print(f"  ❌ ERROR parsing: {e}")
-                    import traceback
-                    traceback.print_exc()
                     continue
             
-            print(f"\n{'='*60}")
-            print(f"Final: {len(posts)} posts collected")
-            print(f"{'='*60}")
-        
-    except requests.exceptions.HTTPError as e:
-        print(f"HTTP Error: {e}")
-        print(f"Response: {e.response.text if e.response else 'No response'}")
+            print(f"✅ Got {len(posts)} English posts from menu {menu_seq}")
+            return posts
+            
         return []
+        
     except Exception as e:
         print(f"Error fetching forum via API: {e}")
         return []
