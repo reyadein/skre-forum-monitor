@@ -4,10 +4,28 @@ import os
 from datetime import datetime
 import time
 import re
+import traceback
 
-class SupabaseClient:
-    """Simple Supabase client untuk REST API"""
+# --- 1. SETUP REGEX UNTUK FILTER BAHASA ---
+def is_actually_english(text):
+    """
+    Return True jika teks bersih dari karakter CJK (China/Jepang/Korea) dan Thai.
+    """
+    if not text: return False
     
+    # Regex range untuk:
+    # CJK (China/Jepang/Hanzi): \u4e00-\u9fff
+    # Hangul (Korea): \uac00-\ud7af
+    # Hiragana/Katakana: \u3040-\u30ff
+    # Thai (Thailand): \u0e00-\u0e7f  <-- Tadi nongol di log kamu
+    non_english_pattern = re.compile(r'[\u4e00-\u9fff\uac00-\ud7af\u3040-\u30ff\u0e00-\u0e7f]')
+    
+    if non_english_pattern.search(text):
+        return False # Ada huruf asing
+    return True
+
+# --- 2. SUPABASE CLIENT (TETAP SAMA) ---
+class SupabaseClient:
     def __init__(self, url, key):
         self.url = url
         self.key = key
@@ -19,7 +37,6 @@ class SupabaseClient:
         }
     
     def get_seen_posts(self):
-        """Get all seen posts from Supabase"""
         try:
             response = requests.get(
                 f"{self.url}/rest/v1/seen_posts?select=post_id",
@@ -34,7 +51,6 @@ class SupabaseClient:
             return []
     
     def add_seen_post(self, post_id, title, board):
-        """Add a seen post to Supabase"""
         try:
             data = {
                 'post_id': post_id,
@@ -55,7 +71,6 @@ class SupabaseClient:
             return False
     
     def cleanup_old_posts(self, keep_count=100):
-        """Keep only the most recent N posts"""
         try:
             response = requests.get(
                 f"{self.url}/rest/v1/seen_posts?select=id,notified_at&order=notified_at.desc",
@@ -64,7 +79,6 @@ class SupabaseClient:
             )
             response.raise_for_status()
             posts = response.json()
-            
             if len(posts) > keep_count:
                 old_posts = posts[keep_count:]
                 for post in old_posts:
@@ -73,250 +87,194 @@ class SupabaseClient:
                         headers=self.headers,
                         timeout=10
                     )
-                print(f"Cleaned up {len(old_posts)} old posts")
-            
             return True
         except Exception as e:
             print(f"Error cleaning up: {e}")
             return False
 
-
+# --- 3. PARSE ARTICLE (DISESUAIKAN DENGAN STRUKTUR BARU) ---
 def parse_article(item, menu_seq):
-    """Parse article from API response into structured format"""
+    # Mapping Key Baru berdasarkan Log User
+    article_id = str(item.get('id', ''))
+    title = item.get('title', '').strip()
     
-    article_seq = item.get('articleSeq', '')
-    title = item.get('articleTitle', '').strip()
+    # Date handling (bisa timestamp int atau string ISO)
+    reg_date = item.get('regDate') 
     
-    # Get date
-    write_datetime = item.get('writeDatetime', 0)
-    if write_datetime:
-        date_obj = datetime.fromtimestamp(write_datetime / 1000)
+    try:
+        # Biasanya regDate itu string ISO "2024-01-05T..." di struktur baru
+        # Tapi kalau timestamp (ms), kita handle juga
+        if isinstance(reg_date, int):
+             date_obj = datetime.fromtimestamp(reg_date / 1000)
+        elif isinstance(reg_date, str):
+             # Coba parse ISO format sederhana
+             date_obj = datetime.fromisoformat(reg_date.replace('Z', '+00:00'))
+        else:
+             date_obj = datetime.now() # Fallback
+             
         date = date_obj.strftime('%Y-%m-%d %H:%M')
-        date_full = date_obj.strftime('%B %d, %Y at %H:%M')
-    else:
+    except:
         date = 'N/A'
-        date_full = 'N/A'
+
+    # URL Builder
+    post_url = f"https://forum.netmarble.com/sk_rebirth_gl/view/{menu_seq}/{article_id}"
     
-    # Build post URL
-    post_url = f"https://forum.netmarble.com/sk_rebirth_gl/view/{menu_seq}/{article_seq}"
-    
-    # Get board name from API response
-    board_name = item.get('menuName', 'Unknown')
-    
-    # Get author
-    author = item.get('writerNickName', 'Unknown')
-    
-    # Get counts
-    view_count = item.get('viewCount', 0)
-    like_count = item.get('likeCount', 0)
-    reply_count = item.get('replyCount', 0)
-    
-    # Check if pinned
-    is_pinned = item.get('topArticleYn', 'N') == 'Y'
+    # Map Board Name Manual karena 'menuName' hilang dari JSON
+    board_map = {10: 'Notices', 11: 'Updates', 13: 'Developer Notes'}
+    board_name = board_map.get(int(menu_seq), 'General')
     
     return {
-        'id': str(article_seq),
+        'id': article_id,
         'title': title,
         'url': post_url,
         'date': date,
-        'date_full': date_full,
         'board': board_name,
-        'menu_seq': menu_seq,
-        'author': author,
-        'view_count': view_count,
-        'like_count': like_count,
-        'reply_count': reply_count,
-        'is_pinned': is_pinned,
-        'article_seq': article_seq
+        'author': item.get('nickname', 'Admin'),
+        'view_count': item.get('viewCount', 0),
+        'reply_count': item.get('replyCount', 0),
+        'is_pinned': False # Struktur baru tidak ada flag pinned yang jelas di root
     }
 
-def is_actually_english(text):
-    """
-    Cek apakah text mayoritas ASCII (English).
-    Return False jika terdeteksi karakter CJK (China/Japan/Korea)
-    """
-    if not text: return False
-    
-    # Cek apakah ada karakter Hangul (Korea), Hiragana/Katakana (Jepang), atau Hanzi (China)
-    # Range Unicode untuk CJK
-    cjk_pattern = re.compile(r'[\u4e00-\u9fff\uac00-\ud7af\u3040-\u309f\u30a0-\u30ff]')
-    
-    if cjk_pattern.search(text):
-        return False # Ada huruf cacing, berarti bukan English
-        
-    return True
-
-def fetch_forum_posts_api(menu_seq, rows=15, english_only=False):
+# --- 4. FETCH FUNCTION (UPDATE TOTAL) ---
+def fetch_forum_posts_api(menu_seq, rows=10, english_only=True):
     try:
         session = requests.Session()
-        # Fake Header Mobile Browser biar lebih dipercaya
+        main_url = f"https://forum.netmarble.com/sk_rebirth_gl/list/{menu_seq}/1"
+        
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
-            'Referer': f"https://forum.netmarble.com/sk_rebirth_gl/list/{menu_seq}/1",
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Referer': main_url,
             'Accept': 'application/json'
         }
         
         api_url = "https://forum.netmarble.com/api/game/tskgb/official/forum/sk_rebirth_gl/article/list"
+        
+        # Parameter API
         params = {
-            'rows': 5, # Cukup 5 biji buat intip
+            'rows': rows * 2, # Ambil lebih banyak untuk cadangan filter
             'start': 0,
             'menuSeq': menu_seq,
             '_': int(time.time() * 1000)
         }
         
-        print(f"\n[{menu_seq}] INSPECTING JSON STRUCTURE...")
+        print(f"Requesting API Menu {menu_seq}...")
         response = session.get(api_url, headers=headers, params=params, timeout=15)
+        response.raise_for_status()
         
         data = response.json()
+        posts = []
         
         if 'articleList' in data and data['articleList']:
-            first_item = data['articleList'][0]
+            raw_list = data['articleList']
+            print(f"  > API returned {len(raw_list)} items.")
             
-            print(f"\n--- ISI DATA PERTAMA DARI NETMARBLE (Menu {menu_seq}) ---")
-            print("KEYS YANG TERSEDIA:")
-            print(list(first_item.keys())) # Kita lihat nama key yang bener apa
+            for item in raw_list:
+                try:
+                    # Ambil Title (Key Baru)
+                    title = item.get('title', '').strip()
+                    if not title: continue
+
+                    # --- LOGIKA FILTER JUDUL (REGEX) ---
+                    if english_only:
+                        if not is_actually_english(title):
+                            # print(f"    Skip Non-English: {title[:30]}...")
+                            continue
+                    
+                    # Kalau lolos filter
+                    post = parse_article(item, menu_seq)
+                    if post['id']:
+                        posts.append(post)
+                    
+                    if len(posts) >= rows:
+                        break
+                        
+                except Exception as e:
+                    print(f"Error parsing item: {e}")
+                    continue
             
-            print("\nCONTOH ISI FULL:")
-            print(json.dumps(first_item, indent=2, ensure_ascii=False)[:500]) # Print 500 huruf pertama
-            print("--------------------------------------------------\n")
+            print(f"  > Collected {len(posts)} valid posts.")
+            return posts
             
-            return [] # Kita cuma mau liat, return kosong aja
-            
-        else:
-            print(f"⚠️ articleList kosong/tidak ditemukan. Keys root: {list(data.keys())}")
-            return []
-            
+        return []
+        
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error fetching forum: {e}")
         return []
 
+# --- 5. HELPERS LAINNYA ---
 def deduplicate_posts(posts):
-    """Remove duplicate posts by ID"""
     seen_ids = set()
     unique = []
-    
     for post in posts:
-        post_id = post['id']
-        if post_id not in seen_ids:
-            seen_ids.add(post_id)
+        if post['id'] not in seen_ids:
+            seen_ids.add(post['id'])
             unique.append(post)
-        else:
-            print(f"⏭️  Skipping duplicate: {post['title'][:50]}")
-    
     return unique
 
-
 def fetch_multiple_boards(rows_per_board=10):
-    """
-    Fetch English posts from multiple official boards
-    
-    Args:
-        rows_per_board: Number of posts to fetch per board
-    
-    Returns:
-        List of unique English posts from all boards
-    """
-    
-    boards = [
-        ('10', 'Notices'),
-        ('11', 'Updates'),
-        ('13', 'Developer Notes')
-    ]
-    
+    # Menu IDs: 10=Notices, 11=Updates, 13=Dev Notes
+    boards = [10, 11, 13]
     all_posts = []
     
-    for menu_seq, board_name in boards:
-        print(f"\n{'='*60}")
-        print(f"Fetching from: {board_name} (menuSeq: {menu_seq})")
-        print(f"{'='*60}")
-        
-        try:
-            # Fetch ENGLISH ONLY posts
-            posts = fetch_forum_posts_api(
-                menu_seq=menu_seq,
-                rows=rows_per_board,
-                english_only=True
-            )
+    for menu_seq in boards:
+        posts = fetch_forum_posts_api(menu_seq, rows=rows_per_board, english_only=True)
+        all_posts.extend(posts)
             
-            print(f"✅ Found {len(posts)} English posts from {board_name}")
-            all_posts.extend(posts)
-            
-        except Exception as e:
-            print(f"❌ Error fetching {board_name}: {e}")
-            continue
-    
-    # Deduplicate by post ID
-    unique_posts = deduplicate_posts(all_posts)
-    
-    print(f"\n{'='*60}")
-    print(f"Summary: Total {len(unique_posts)} unique English posts from {len(boards)} boards")
-    print(f"{'='*60}")
-    
-    return unique_posts
-
+    return deduplicate_posts(all_posts)
 
 def send_telegram_message(bot_token, chat_id, message):
-    """Send message to Telegram with retry logic"""
-    
-    max_retries = 3
-    retry_delay = 2
-    
-    for attempt in range(max_retries):
-        try:
-            # Always use HTTPS
-            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-            
-            payload = {
-                'chat_id': chat_id,
-                'text': message,
-                'parse_mode': 'HTML',
-                'disable_web_page_preview': False
-            }
-            
-            print(f"Sending to Telegram (attempt {attempt + 1}/{max_retries})...")
-            
-            response = requests.post(url, json=payload, timeout=30)
-            
-            print(f"Telegram API Response: {response.status_code}")
-            
-            if response.status_code == 200:
-                print(f"✅ Message sent successfully!")
-                return True
-            else:
-                print(f"❌ Telegram error: {response.text}")
-                
-        except Exception as e:
-            print(f"❌ Error sending telegram (attempt {attempt + 1}): {e}")
-            
-            if attempt < max_retries - 1:
-                print(f"Retrying in {retry_delay} seconds...")
-                time.sleep(retry_delay)
-            
-    print(f"❌ Failed to send message after {max_retries} attempts")
-    return False
-
+    try:
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        payload = {'chat_id': chat_id, 'text': message, 'parse_mode': 'HTML', 'disable_web_page_preview': False}
+        requests.post(url, json=payload, timeout=10)
+        return True
+    except:
+        return False
 
 def format_telegram_message(post):
-    """Format Telegram notification message"""
-    
-    # Board icon
-    board_icons = {
-        'Notices': '📢',
-        'Updates': '🆕',
-        'Developer Notes': '💬'
-    }
-    icon = board_icons.get(post['board'], '📝')
-    
-    # Pinned indicator
-    pinned = '📌 <b>PINNED</b>\n' if post['is_pinned'] else ''
-    
-    message = f"""{icon} <b>Seven Knights Rebirth - {post['board']}</b>
+    icons = {'Notices': '📢', 'Updates': '🆕', 'Developer Notes': '💬'}
+    icon = icons.get(post['board'], '📝')
+    return f"{icon} <b>Seven Knights Rebirth - {post['board']}</b>\n\n<b>{post['title']}</b>\n\n📅 {post['date']}\n🔗 <a href=\"{post['url']}\">Read Post</a>"
 
-{pinned}<b>{post['title']}</b>
-
-📅 {post['date']}
-✍️ By {post['author']}
-🔗 <a href="{post['url']}">Read Full Post</a>
-"""
+# --- MAIN ---
+if __name__ == "__main__":
+    print("🚀 Starting Monitor (New JSON Structure)...")
     
-    return message
+    # Load Env
+    SUPABASE_URL = os.getenv("SUPABASE_URL")
+    SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+    TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+    # 1. Fetch
+    new_posts = fetch_multiple_boards(rows_per_board=5)
+    
+    if new_posts:
+        print(f"\nFound {len(new_posts)} potential posts.")
+        
+        # 2. Database Check
+        seen_ids = []
+        if SUPABASE_URL and SUPABASE_KEY:
+            db = SupabaseClient(SUPABASE_URL, SUPABASE_KEY)
+            seen_ids = db.get_seen_posts()
+        
+        # 3. Send & Save
+        sent_count = 0
+        for post in reversed(new_posts):
+            if post['id'] not in seen_ids:
+                print(f"Sending: {post['title']}")
+                msg = format_telegram_message(post)
+                
+                success = True
+                if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+                    success = send_telegram_message(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, msg)
+                    time.sleep(1)
+                
+                if success and SUPABASE_URL:
+                    db.add_seen_post(post['id'], post['title'], post['board'])
+                    sent_count += 1
+        
+        print(f"Done. Sent {sent_count} new notifications.")
+        if SUPABASE_URL: db.cleanup_old_posts()
+    else:
+        print("No posts found.")
